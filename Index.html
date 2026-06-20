@@ -1,0 +1,183 @@
+<!DOCTYPE html>
+<html lang="it">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1.0">
+<title>Universal Markdown Converter</title>
+
+<script src="https://cdnjs.cloudflare.com/ajax/libs/pdf.js/4.5.136/pdf.min.js"></script>
+<script src="https://unpkg.com/turndown/dist/turndown.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/xlsx/0.18.5/xlsx.full.min.js"></script>
+<script src="https://unpkg.com/tesseract.js@5/dist/tesseract.min.js"></script>
+
+<style>
+*{box-sizing:border-box;font-family:-apple-system,BlinkMacSystemFont,Segoe UI,sans-serif}
+body{background:#f5f7fa;padding:20px;margin:0}
+.container{max-width:1200px;margin:auto}
+.card{background:#fff;padding:20px;border-radius:16px;box-shadow:0 4px 20px rgba(0,0,0,.08)}
+.upload{border:2px dashed #ff7a00;padding:40px;text-align:center;border-radius:12px;transition:.2s}
+.upload.dragover{background:#fff4ea}
+button{background:#ff7a00;color:#fff;border:none;padding:12px 18px;border-radius:10px;cursor:pointer}
+.actions{display:flex;gap:10px;flex-wrap:wrap;margin:15px 0}
+textarea{width:100%;height:500px;padding:15px;border-radius:12px;border:1px solid #ddd}
+</style>
+</head>
+<body>
+<div class="container">
+<div class="card">
+<h1>📄 Universal Markdown Converter</h1>
+<p>PDF, HTML, JSON, CSV, Excel e immagini → Markdown</p>
+
+<div id="dropZone" class="upload">
+<h3>📂 Trascina un file qui</h3>
+<input type="file" id="fileInput"
+accept=".pdf,.html,.htm,.json,.csv,.xlsx,.xls,.png,.jpg,.jpeg,.webp">
+<p id="fileName">Nessun file selezionato</p>
+</div>
+
+<div class="actions">
+<button onclick="convertFile()">Converti</button>
+<button onclick="copyMarkdown()">Copia</button>
+<button onclick="downloadMarkdown()">Scarica .md</button>
+</div>
+
+<p id="status">Pronto</p>
+<textarea id="output"></textarea>
+</div>
+</div>
+
+<script>
+pdfjsLib.GlobalWorkerOptions.workerSrc='https://cdnjs.cloudflare.com/ajax/libs/pdf.js/4.5.136/pdf.worker.min.js';
+
+const td=new TurndownService();
+let selectedFile=null;
+
+const dz=document.getElementById('dropZone');
+const fi=document.getElementById('fileInput');
+
+fi.addEventListener('change',e=>{
+ selectedFile=e.target.files[0];
+ document.getElementById('fileName').textContent=selectedFile.name;
+});
+
+['dragenter','dragover'].forEach(ev=>{
+ dz.addEventListener(ev,e=>{
+  e.preventDefault();
+  dz.classList.add('dragover');
+ });
+});
+
+['dragleave','drop'].forEach(ev=>{
+ dz.addEventListener(ev,e=>{
+  e.preventDefault();
+  dz.classList.remove('dragover');
+ });
+});
+
+dz.addEventListener('drop',e=>{
+ const file=e.dataTransfer.files[0];
+ selectedFile=file;
+ const dt=new DataTransfer();
+ dt.items.add(file);
+ fi.files=dt.files;
+ document.getElementById('fileName').textContent=file.name;
+});
+
+async function convertFile(){
+ const file=selectedFile||fi.files[0];
+ if(!file) return alert('Seleziona un file');
+
+ document.getElementById('status').textContent='Conversione...';
+
+ try{
+  const ext=file.name.split('.').pop().toLowerCase();
+  let md='';
+
+  switch(ext){
+   case 'pdf': md=await pdfToMd(file); break;
+   case 'html':
+   case 'htm': md=await htmlToMd(file); break;
+   case 'json': md=await jsonToMd(file); break;
+   case 'csv': md=await csvToMd(file); break;
+   case 'xls':
+   case 'xlsx': md=await excelToMd(file); break;
+   case 'png':
+   case 'jpg':
+   case 'jpeg':
+   case 'webp': md=await imageToMd(file); break;
+   default: throw new Error('Formato non supportato');
+  }
+
+  output.value=md;
+  status.textContent='Conversione completata';
+ }
+ catch(err){
+  status.textContent=err.message;
+ }
+}
+
+async function pdfToMd(file){
+ const pdf=await pdfjsLib.getDocument({data:await file.arrayBuffer()}).promise;
+ let md='';
+ for(let i=1;i<=pdf.numPages;i++){
+  const page=await pdf.getPage(i);
+  const txt=await page.getTextContent();
+  md+=`## Pagina ${i}\n\n`+txt.items.map(x=>x.str).join(' ')+'\n\n';
+ }
+ return md;
+}
+
+async function htmlToMd(file){
+ return td.turndown(await file.text());
+}
+
+async function jsonToMd(file){
+ const obj=JSON.parse(await file.text());
+ return '```json\n'+JSON.stringify(obj,null,2)+'\n```';
+}
+
+async function csvToMd(file){
+ const rows=(await file.text()).split(/\r?\n/).map(r=>r.split(','));
+ if(!rows.length) return '';
+ let md='| '+rows[0].join(' | ')+' |\n';
+ md+='| '+rows[0].map(()=> '---').join(' | ')+' |\n';
+ rows.slice(1).forEach(r=>md+='| '+r.join(' | ')+' |\n');
+ return md;
+}
+
+async function excelToMd(file){
+ const wb=XLSX.read(await file.arrayBuffer(),{type:'array'});
+ let md='';
+ wb.SheetNames.forEach(name=>{
+  md+='# '+name+'\n\n';
+  const data=XLSX.utils.sheet_to_json(wb.Sheets[name],{header:1});
+  if(data.length){
+   md+='| '+data[0].join(' | ')+' |\n';
+   md+='| '+data[0].map(()=> '---').join(' | ')+' |\n';
+   data.slice(1).forEach(r=>md+='| '+r.join(' | ')+' |\n');
+  }
+  md+='\n';
+ });
+ return md;
+}
+
+async function imageToMd(file){
+ const result=await Tesseract.recognize(file,'ita+eng');
+ return '# Testo estratto\n\n'+result.data.text;
+}
+
+async function copyMarkdown(){
+ await navigator.clipboard.writeText(output.value);
+ alert('Copiato');
+}
+
+function downloadMarkdown(){
+ const blob=new Blob([output.value],{type:'text/markdown'});
+ const a=document.createElement('a');
+ a.href=URL.createObjectURL(blob);
+ a.download='converted.md';
+ a.click();
+}
+</script>
+</body>
+</html>
