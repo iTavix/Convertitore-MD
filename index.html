@@ -10,7 +10,6 @@
 <script src="https://cdnjs.cloudflare.com/ajax/libs/turndown-plugin-gfm/1.0.2/turndown-plugin-gfm.min.js"></script>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/mammoth/1.8.0/mammoth.browser.min.js"></script>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/marked/12.0.2/marked.min.js"></script>
-<script src="https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.min.js"></script>
 
 <style>
   :root {
@@ -360,7 +359,7 @@
 <div class="container">
   <header>
     <h1>Markdownify</h1>
-    <p class="subtitle">Converti i tuoi file in Markdown pulito, pronti da allegare a un'AI.</p>
+    <p class="subtitle">Converti i tuoi file in Markdown pulito, direttamente nel browser.</p>
   </header>
 
   <!-- Drop zone -->
@@ -375,10 +374,10 @@
     <p class="dz-title">Trascina un file qui</p>
     <p class="dz-hint">oppure tocca per sceglierlo dal dispositivo</p>
     <div class="formats">
-      <span>.pdf</span><span>.docx</span><span>.html</span><span>.csv</span><span>.json</span><span>.md</span><span>codice</span>
+      <span>.docx</span><span>.html</span><span>.txt</span><span>.csv</span><span>.json</span><span>.md</span>
     </div>
   </div>
-  <input type="file" id="fileInput" class="hidden">
+  <input type="file" id="fileInput" class="hidden" accept=".docx,.html,.htm,.txt,.csv,.json,.md,.markdown">
 
   <!-- Status -->
   <div class="status" id="status"></div>
@@ -427,32 +426,17 @@
 
   let currentBaseName = "documento";
 
-  // --- Turndown (HTML -> Markdown), created lazily so a missing CDN
-  //     never crashes the whole app at startup ---
-  let _turndown = null;
-  function getTurndown() {
-    if (_turndown) return _turndown;
-    if (typeof TurndownService === "undefined") {
-      throw new Error("Libreria di conversione HTML non caricata: controlla la connessione o eventuali blocchi sugli script esterni.");
-    }
-    _turndown = new TurndownService({
-      headingStyle: "atx",
-      hr: "---",
-      bulletListMarker: "-",
-      codeBlockStyle: "fenced",
-      emDelimiter: "_"
-    });
-    // Enable GitHub Flavored Markdown (tables, strikethrough, task lists)
-    if (window.turndownPluginGfm) {
-      _turndown.use(window.turndownPluginGfm.gfm);
-    }
-    return _turndown;
-  }
-
-  // --- pdf.js worker setup ---
-  if (window.pdfjsLib) {
-    window.pdfjsLib.GlobalWorkerOptions.workerSrc =
-      "https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.worker.min.js";
+  // --- Turndown setup (HTML -> Markdown) ---
+  const turndown = new TurndownService({
+    headingStyle: "atx",
+    hr: "---",
+    bulletListMarker: "-",
+    codeBlockStyle: "fenced",
+    emDelimiter: "_"
+  });
+  // Enable GitHub Flavored Markdown (tables, strikethrough, task lists)
+  if (window.turndownPluginGfm) {
+    turndown.use(window.turndownPluginGfm.gfm);
   }
 
   // --- Status helpers ---
@@ -542,66 +526,6 @@
     return rows;
   }
 
-  // PDF -> Markdown (text extraction, page by page)
-  async function pdfToMarkdown(buffer) {
-    if (!window.pdfjsLib) throw new Error("Libreria PDF non caricata. Controlla la connessione e riprova.");
-    const pdf = await window.pdfjsLib.getDocument({ data: buffer }).promise;
-    const pages = [];
-    for (let p = 1; p <= pdf.numPages; p++) {
-      const page = await pdf.getPage(p);
-      const content = await page.getTextContent();
-      let text = "";
-      content.items.forEach(function (item) {
-        text += item.str;
-        if (item.hasEOL) text += "\n";
-      });
-      // Collapse excessive blank lines
-      text = text.replace(/[ \t]+\n/g, "\n").replace(/\n{3,}/g, "\n\n").trim();
-      pages.push(text);
-    }
-    const body = pages.join("\n\n---\n\n");
-    return body || "_Nessun testo estraibile: il PDF potrebbe essere composto da immagini scansionate._";
-  }
-
-  // Map file extensions to Markdown code-fence language hints.
-  const CODE_LANGS = {
-    js: "javascript", mjs: "javascript", cjs: "javascript", jsx: "jsx",
-    ts: "typescript", tsx: "tsx", py: "python", rb: "ruby", php: "php",
-    java: "java", kt: "kotlin", kts: "kotlin", c: "c", h: "c",
-    cpp: "cpp", cc: "cpp", cxx: "cpp", hpp: "cpp", cs: "csharp",
-    go: "go", rs: "rust", swift: "swift", scala: "scala", m: "objectivec",
-    sh: "bash", bash: "bash", zsh: "bash", fish: "bash", ps1: "powershell",
-    bat: "bat", sql: "sql", r: "r", lua: "lua", dart: "dart", pl: "perl",
-    css: "css", scss: "scss", sass: "sass", less: "less", styl: "stylus",
-    xml: "xml", svg: "xml", yaml: "yaml", yml: "yaml", toml: "toml",
-    ini: "ini", cfg: "ini", conf: "ini", env: "bash", properties: "ini",
-    vue: "vue", svelte: "svelte", astro: "astro", graphql: "graphql",
-    gql: "graphql", dockerfile: "dockerfile", makefile: "makefile",
-    tex: "latex", log: "", csv: "", tsv: ""
-  };
-
-  // Build a fence longer than any backtick run inside the text, so code with
-  // its own ``` blocks never breaks out of the wrapper.
-  function fenceFor(text) {
-    let max = 0, run = 0;
-    for (let i = 0; i < text.length; i++) {
-      if (text[i] === "`") { run++; if (run > max) max = run; } else { run = 0; }
-    }
-    return "`".repeat(Math.max(3, max + 1));
-  }
-
-  // Heuristic: does the decoded text look like binary garbage rather than text?
-  function looksBinary(text) {
-    if (!text) return false;
-    const n = Math.min(text.length, 2000);
-    let bad = 0;
-    for (let i = 0; i < n; i++) {
-      const c = text.charCodeAt(i);
-      if (c === 0 || c === 0xFFFD) bad++;
-    }
-    return bad / n > 0.1;
-  }
-
   // JSON -> fenced code block (pretty-printed)
   function jsonToMarkdown(text) {
     try {
@@ -612,111 +536,6 @@
     }
   }
 
-  // Dependency-free HTML -> Markdown, using the browser's built-in DOMParser.
-  // Used as a fallback when the Turndown CDN didn't load, so HTML always converts.
-  function htmlToMarkdownFallback(htmlString) {
-    const doc = new DOMParser().parseFromString(htmlString, "text/html");
-    doc.querySelectorAll("script, style, noscript, head").forEach(function (n) { n.remove(); });
-
-    function inlineChildren(node) {
-      let out = "";
-      node.childNodes.forEach(function (child) { out += renderNode(child); });
-      return out;
-    }
-
-    function renderNode(node) {
-      if (node.nodeType === 3) return node.nodeValue.replace(/\s+/g, " ");
-      if (node.nodeType !== 1) return "";
-      const tag = node.tagName.toLowerCase();
-      const kids = inlineChildren(node);
-      switch (tag) {
-        case "br": return "  \n";
-        case "hr": return "\n\n---\n\n";
-        case "strong": case "b": return kids.trim() ? "**" + kids.trim() + "**" : "";
-        case "em": case "i": return kids.trim() ? "_" + kids.trim() + "_" : "";
-        case "code":
-          return node.closest("pre") ? kids : "`" + node.textContent + "`";
-        case "a": {
-          const href = node.getAttribute("href") || "";
-          const t = kids.trim() || href;
-          return href ? "[" + t + "](" + href + ")" : t;
-        }
-        case "img": {
-          const src = node.getAttribute("src") || "";
-          return src ? "![" + (node.getAttribute("alt") || "") + "](" + src + ")" : "";
-        }
-        case "h1": case "h2": case "h3": case "h4": case "h5": case "h6":
-          return "\n\n" + "#".repeat(Number(tag[1])) + " " + kids.trim() + "\n\n";
-        case "p": return "\n\n" + kids.trim() + "\n\n";
-        case "blockquote":
-          return "\n\n" + inlineChildren(node).trim().split("\n")
-            .map(function (l) { return "> " + l; }).join("\n") + "\n\n";
-        case "ul": return "\n\n" + listToMd(node, false) + "\n";
-        case "ol": return "\n\n" + listToMd(node, true) + "\n";
-        case "pre": {
-          const codeEl = node.querySelector("code");
-          const txt = (codeEl ? codeEl.textContent : node.textContent).replace(/\n$/, "");
-          return "\n\n```\n" + txt + "\n```\n\n";
-        }
-        case "table": return "\n\n" + htmlTableToMd(node) + "\n\n";
-        default: return kids;
-      }
-    }
-
-    function listToMd(node, ordered) {
-      let out = "", i = 1;
-      Array.prototype.forEach.call(node.children, function (li) {
-        if (li.tagName.toLowerCase() !== "li") return;
-        const marker = ordered ? (i++ + ". ") : "- ";
-        out += marker + inlineChildren(li).trim().replace(/\n/g, "\n  ") + "\n";
-      });
-      return out;
-    }
-
-    function htmlTableToMd(node) {
-      const rows = [];
-      node.querySelectorAll("tr").forEach(function (tr) {
-        const cells = [];
-        tr.querySelectorAll("th, td").forEach(function (cell) {
-          cells.push(inlineChildren(cell).trim().replace(/\|/g, "\\|").replace(/\n/g, " "));
-        });
-        if (cells.length) rows.push(cells);
-      });
-      if (!rows.length) return "";
-      const cols = Math.max.apply(null, rows.map(function (r) { return r.length; }));
-      const pad = function (r) { const c = r.slice(); while (c.length < cols) c.push(""); return c; };
-      let md = "| " + pad(rows[0]).join(" | ") + " |\n";
-      md += "| " + pad(rows[0]).map(function () { return "---"; }).join(" | ") + " |\n";
-      for (let i = 1; i < rows.length; i++) md += "| " + pad(rows[i]).join(" | ") + " |\n";
-      return md;
-    }
-
-    return inlineChildren(doc.body || doc.documentElement)
-      .replace(/[ \t]+\n/g, "\n").replace(/\n{3,}/g, "\n\n").trim();
-  }
-
-  // Extract the meaningful part of an HTML document: prefer <main>/<article>,
-  // otherwise the <body> — so <head>/<title>/scripts never leak into the output.
-  function extractMainHtml(htmlString) {
-    try {
-      const doc = new DOMParser().parseFromString(htmlString, "text/html");
-      doc.querySelectorAll("script, style, noscript").forEach(function (n) { n.remove(); });
-      const main = doc.querySelector("main, article");
-      const root = main || doc.body || doc.documentElement;
-      return root ? root.innerHTML : htmlString;
-    } catch (e) {
-      return htmlString;
-    }
-  }
-
-  // Unified HTML -> Markdown: prefer Turndown, fall back to the built-in converter.
-  function htmlToMd(html) {
-    if (typeof TurndownService !== "undefined") {
-      try { return getTurndown().turndown(html); } catch (e) { /* fall through */ }
-    }
-    return htmlToMarkdownFallback(html);
-  }
-
   // Main dispatcher
   async function convertFile(file) {
     const name = file.name || "documento";
@@ -724,25 +543,21 @@
     const ext = dot >= 0 ? name.slice(dot + 1).toLowerCase() : "";
     currentBaseName = dot >= 0 ? name.slice(0, dot) : name;
 
-    if (ext === "pdf") {
-      showLoading("Estrazione del testo dal PDF…");
-      const buffer = await readAsArrayBuffer(file);
-      return await pdfToMarkdown(buffer);
-    }
-
     if (ext === "docx") {
       showLoading("Conversione del documento Word…");
-      if (!window.mammoth) throw new Error("Libreria per i file Word non caricata: controlla la connessione e riprova.");
       const buffer = await readAsArrayBuffer(file);
       const res = await window.mammoth.convertToHtml({ arrayBuffer: buffer });
-      return htmlToMd(res.value || "");
+      return turndown.turndown(res.value || "");
     }
 
     if (ext === "html" || ext === "htm") {
       showLoading("Conversione HTML…");
-      const raw = await readAsText(file);
-      // Convert only the body / main content so head, title and scripts don't leak in.
-      return htmlToMd(extractMainHtml(raw));
+      const html = await readAsText(file);
+      // Strip <script>/<style> noise before converting
+      const cleaned = html
+        .replace(/<script[\s\S]*?<\/script>/gi, "")
+        .replace(/<style[\s\S]*?<\/style>/gi, "");
+      return turndown.turndown(cleaned);
     }
 
     if (ext === "csv") {
@@ -762,42 +577,14 @@
       return await readAsText(file);
     }
 
-    // Any other text-based or source-code file: wrap it in a fenced code block
-    // with a language hint — the cleanest way to feed code to an AI.
-    showLoading("Lettura del file…");
-    const text = await readAsText(file);
-    if (looksBinary(text)) {
-      throw new Error("Il file “." + ext + "” sembra binario e non può essere letto come testo. Usa PDF, DOCX o un file di testo/codice.");
-    }
-    const baseName = (file.name || "").toLowerCase();
-    let lang = CODE_LANGS[ext];
-    if (lang === undefined) {
-      if (baseName === "dockerfile") lang = "dockerfile";
-      else if (baseName === "makefile") lang = "makefile";
-      else lang = "";
-    }
-    const fence = fenceFor(text);
-    return fence + lang + "\n" + text.replace(/\s+$/, "") + "\n" + fence + "\n";
-  }
-
-  // Reject if a conversion takes too long (e.g. a CDN worker that never loads),
-  // so the loading spinner can never hang forever with no feedback.
-  function withTimeout(promise, ms, label) {
-    return Promise.race([
-      promise,
-      new Promise(function (_, reject) {
-        setTimeout(function () {
-          reject(new Error((label || "Operazione") + " troppo lunga: la conversione è stata interrotta. Riprova o controlla la connessione."));
-        }, ms);
-      })
-    ]);
+    throw new Error("Formato non supportato: ." + ext);
   }
 
   async function handleFile(file) {
     if (!file) return;
     clearStatus();
     try {
-      const markdown = await withTimeout(convertFile(file), 30000, "Conversione");
+      const markdown = await convertFile(file);
       clearStatus();
       filenameEl.textContent = file.name;
       sourceArea.value = markdown;
@@ -885,21 +672,6 @@
   // Prevent the browser from opening a file dropped outside the zone
   window.addEventListener("dragover", function (e) { e.preventDefault(); });
   window.addEventListener("drop", function (e) { e.preventDefault(); });
-
-  // --- Startup check: warn (without blocking) if external libraries didn't load.
-  //     Text formats (HTML, CSV, JSON, TXT, MD) still work as long as Turndown is present. ---
-  function checkLibraries() {
-    const missing = [];
-    if (!window.mammoth) missing.push("Word .docx");
-    if (!window.pdfjsLib) missing.push("PDF");
-    if (missing.length) {
-      statusEl.className = "status loading show";
-      statusEl.textContent = "Nota: la conversione per " + missing.join(" e ") +
-        " non è disponibile (libreria esterna non caricata). HTML, CSV, JSON, TXT e MD funzionano comunque.";
-    }
-  }
-  // Give the CDN scripts a moment to settle before checking.
-  window.addEventListener("load", function () { setTimeout(checkLibraries, 600); });
 })();
 </script>
 </body>
