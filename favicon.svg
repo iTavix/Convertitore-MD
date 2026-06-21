@@ -1,0 +1,6 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" width="64" height="64">
+  <rect width="64" height="64" rx="14" fill="#0071e3"/>
+  <text x="32" y="25" font-family="-apple-system, BlinkMacSystemFont, 'Helvetica Neue', Arial, sans-serif" font-size="30" font-weight="700" fill="#ffffff" text-anchor="middle" dominant-baseline="central">M</text>
+  <path d="M32 38 L32 49" stroke="#ffffff" stroke-width="4.5" stroke-linecap="round"/>
+  <path d="M23.5 44 L40.5 44 L32 53 Z" fill="#ffffff"/>
+</svg>
