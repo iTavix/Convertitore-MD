@@ -11,6 +11,7 @@
 <script src="https://cdnjs.cloudflare.com/ajax/libs/mammoth/1.8.0/mammoth.browser.min.js"></script>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/marked/12.0.2/marked.min.js"></script>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/xlsx/0.18.5/xlsx.full.min.js"></script>
 
 <style>
   :root {
@@ -156,6 +157,50 @@
 
   .result.visible { display: block; opacity: 1; transform: translateY(0); }
 
+  .ai-toggle {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    font-size: 13px;
+    font-weight: 500;
+    color: var(--text-secondary);
+    cursor: pointer;
+    user-select: none;
+    white-space: nowrap;
+  }
+  .ai-toggle input { accent-color: var(--accent); width: 15px; height: 15px; cursor: pointer; }
+
+  .result-foot {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 10px;
+    align-items: center;
+    padding: 14px 20px;
+    border-top: 1px solid var(--border);
+  }
+  .result-foot .stat {
+    display: inline-flex;
+    align-items: baseline;
+    gap: 5px;
+    font-size: 13px;
+    color: var(--text-secondary);
+    background: var(--surface-2);
+    border-radius: 980px;
+    padding: 7px 15px;
+    letter-spacing: -0.01em;
+  }
+  .result-foot .stat b {
+    font-size: 16px;
+    font-weight: 600;
+    color: var(--text);
+    letter-spacing: -0.02em;
+  }
+  .result-foot .stat.tok {
+    background: rgba(0, 113, 227, 0.13);
+    background: color-mix(in srgb, var(--accent) 14%, transparent);
+  }
+  .result-foot .stat.tok b { color: var(--accent); }
+
   .result-bar {
     display: flex;
     align-items: center;
@@ -215,6 +260,9 @@
 
   .btn-secondary { background: var(--surface-2); color: var(--text); }
   .btn-secondary:hover { opacity: 0.8; }
+
+  .btn-ghost { background: transparent; color: var(--text-secondary); }
+  .btn-ghost:hover { background: rgba(255, 59, 48, 0.12); color: #ff3b30; }
 
   /* Output area */
   .output-wrap { max-height: 460px; overflow: auto; }
@@ -372,13 +420,13 @@
         <line x1="12" y1="15" x2="12" y2="3"/>
       </svg>
     </div>
-    <p class="dz-title">Trascina un file qui</p>
-    <p class="dz-hint">oppure tocca per sceglierlo dal dispositivo</p>
+    <p class="dz-title">Trascina uno o più file qui</p>
+    <p class="dz-hint">oppure tocca per sceglierli · puoi anche incollare con ⌘/Ctrl+V</p>
     <div class="formats">
-      <span>.pdf</span><span>.docx</span><span>.html</span><span>.csv</span><span>.json</span><span>.md</span><span>codice</span>
+      <span>.pdf</span><span>.docx</span><span>.xlsx</span><span>.html</span><span>.csv</span><span>.json</span><span>.md</span><span>codice</span>
     </div>
   </div>
-  <input type="file" id="fileInput" class="hidden">
+  <input type="file" id="fileInput" class="hidden" multiple>
 
   <!-- Status -->
   <div class="status" id="status"></div>
@@ -387,17 +435,22 @@
   <div class="result" id="result">
     <div class="result-bar">
       <span class="filename" id="filename"></span>
+      <label class="ai-toggle" title="Rimuove immagini base64, righe e spazi superflui">
+        <input type="checkbox" id="aiClean"> Ottimizza per AI
+      </label>
       <div class="tabs" role="tablist">
         <button class="tab active" id="tabSource" role="tab">Markdown</button>
         <button class="tab" id="tabPreview" role="tab">Anteprima</button>
       </div>
       <button class="btn btn-secondary" id="copyBtn">Copia</button>
       <button class="btn btn-primary" id="downloadBtn">Scarica .md</button>
+      <button class="btn btn-ghost" id="clearBtn" title="Cancella e ricomincia">Cancella</button>
     </div>
     <div class="output-wrap">
       <textarea class="source" id="sourceArea" spellcheck="false" aria-label="Codice Markdown"></textarea>
       <div class="preview hidden" id="previewArea"></div>
     </div>
+    <div class="result-foot" id="resultFoot"></div>
   </div>
 </div>
 
@@ -424,8 +477,11 @@
   const copyBtn = document.getElementById("copyBtn");
   const downloadBtn = document.getElementById("downloadBtn");
   const toast = document.getElementById("toast");
+  const aiClean = document.getElementById("aiClean");
+  const resultFoot = document.getElementById("resultFoot");
 
   let currentBaseName = "documento";
+  let rawMarkdown = ""; // last conversion before AI optimization
 
   // --- Turndown (HTML -> Markdown), created lazily so a missing CDN
   //     never crashes the whole app at startup ---
@@ -495,6 +551,33 @@
   }
 
   // --- Converters ---
+
+  // Build a Markdown table from an array of rows (arrays of cells).
+  function rowsToMdTable(rows) {
+    if (!rows.length) return "";
+    const cols = Math.max.apply(null, rows.map(function (r) { return r.length; }));
+    const pad = function (r) {
+      const out = r.slice();
+      while (out.length < cols) out.push("");
+      return out.map(function (c) { return String(c == null ? "" : c).replace(/\|/g, "\\|").replace(/\n/g, " "); });
+    };
+    let md = "| " + pad(rows[0]).join(" | ") + " |\n";
+    md += "| " + pad(rows[0]).map(function () { return "---"; }).join(" | ") + " |\n";
+    for (let i = 1; i < rows.length; i++) md += "| " + pad(rows[i]).join(" | ") + " |\n";
+    return md;
+  }
+
+  // XLSX/XLS -> one Markdown table per sheet (via SheetJS)
+  async function xlsxToMarkdown(buffer) {
+    if (!window.XLSX) throw new Error("Libreria per i fogli di calcolo non caricata: controlla la connessione e riprova.");
+    const wb = window.XLSX.read(buffer, { type: "array" });
+    const parts = [];
+    wb.SheetNames.forEach(function (name) {
+      const rows = window.XLSX.utils.sheet_to_json(wb.Sheets[name], { header: 1, blankrows: false, defval: "" });
+      if (rows.length) parts.push("### " + name + "\n\n" + rowsToMdTable(rows));
+    });
+    return parts.join("\n\n") || "_Foglio di calcolo vuoto._";
+  }
 
   // CSV string -> Markdown table (handles quoted fields and embedded commas/quotes)
   function csvToMarkdown(text) {
@@ -730,6 +813,12 @@
       return await pdfToMarkdown(buffer);
     }
 
+    if (ext === "xlsx" || ext === "xls" || ext === "xlsm") {
+      showLoading("Conversione del foglio di calcolo…");
+      const buffer = await readAsArrayBuffer(file);
+      return await xlsxToMarkdown(buffer);
+    }
+
     if (ext === "docx") {
       showLoading("Conversione del documento Word…");
       if (!window.mammoth) throw new Error("Libreria per i file Word non caricata: controlla la connessione e riprova.");
@@ -793,28 +882,103 @@
     ]);
   }
 
-  async function handleFile(file) {
-    if (!file) return;
+  // --- Output helpers ---
+  function baseNameOf(name) {
+    if (!name) return "documento";
+    const dot = name.lastIndexOf(".");
+    return dot > 0 ? name.slice(0, dot) : name;
+  }
+
+  function estimateTokens(text) { return Math.ceil((text || "").length / 4); }
+
+  function fmt(n) { return n.toLocaleString("it-IT"); }
+
+  function updateFoot() {
+    const v = sourceArea.value;
+    const words = (v.trim().match(/\S+/g) || []).length;
+    resultFoot.innerHTML =
+      '<span class="stat"><b>' + fmt(v.length) + '</b> caratteri</span>' +
+      '<span class="stat"><b>' + fmt(words) + '</b> parole</span>' +
+      '<span class="stat tok"><b>~' + fmt(estimateTokens(v)) + '</b> token</span>';
+  }
+
+  // Strip what inflates tokens without adding meaning, for cleaner AI ingestion.
+  function cleanForAI(md) {
+    return md
+      .replace(/!\[([^\]]*)\]\(\s*data:[^)]*\)/gi, "![$1]")   // drop base64/data-URI images
+      .replace(/\]\(\s*data:[^)]*\)/gi, "]()")                 // drop data-URI links
+      .replace(/[ \t]+$/gm, "")                                // trim trailing whitespace
+      .replace(/\n{3,}/g, "\n\n")                              // collapse blank lines
+      .trim();
+  }
+
+  function displayMarkdown(md, name) {
+    rawMarkdown = md;
+    currentBaseName = baseNameOf(name);
+    const shown = aiClean.checked ? cleanForAI(md) : md;
+    sourceArea.value = shown;
+    renderPreview(shown);
+    switchTab("source");
+    updateFoot();
+    result.classList.add("visible");
+    result.scrollIntoView({ behavior: "smooth", block: "nearest" });
+  }
+
+  // Convert one or many files. Multiple files are merged into a single document.
+  async function handleFiles(fileList) {
+    const files = Array.prototype.slice.call(fileList || []);
+    if (!files.length) return;
     clearStatus();
     try {
-      const markdown = await withTimeout(convertFile(file), 30000, "Conversione");
+      if (files.length === 1) {
+        const md = await withTimeout(convertFile(files[0]), 30000, "Conversione");
+        clearStatus();
+        filenameEl.textContent = files[0].name;
+        displayMarkdown(md, files[0].name);
+        return;
+      }
+      const parts = [];
+      const failed = [];
+      for (let i = 0; i < files.length; i++) {
+        const f = files[i];
+        showLoading("Conversione " + (i + 1) + "/" + files.length + ": " + f.name + "…");
+        try {
+          const md = await withTimeout(convertFile(f), 30000, "Conversione");
+          parts.push("## 📄 " + f.name + "\n\n" + md.trim());
+        } catch (e) {
+          failed.push(f.name);
+          parts.push("## 📄 " + f.name + "\n\n_Conversione non riuscita: " + (e.message || "errore") + "_");
+        }
+      }
       clearStatus();
-      filenameEl.textContent = file.name;
-      sourceArea.value = markdown;
-      renderPreview(markdown);
-      switchTab("source");
-      result.classList.add("visible");
-      result.scrollIntoView({ behavior: "smooth", block: "nearest" });
+      filenameEl.textContent = files.length + " file";
+      displayMarkdown(parts.join("\n\n---\n\n") + "\n", "documenti");
+      if (failed.length) showError(failed.length + " file non convertiti: " + failed.join(", "));
     } catch (err) {
       showError(err.message || "Si è verificato un errore durante la conversione.");
     }
   }
+
+  // Backwards-compatible single-file entry point.
+  function handleFile(file) { return handleFiles([file]); }
 
   function renderPreview(md) {
     if (window.marked) {
       previewArea.innerHTML = window.marked.parse(md);
     }
   }
+
+  // Re-apply (or undo) AI cleanup on the current result without re-converting.
+  aiClean.addEventListener("change", function () {
+    if (!result.classList.contains("visible")) return;
+    const shown = aiClean.checked ? cleanForAI(rawMarkdown) : rawMarkdown;
+    sourceArea.value = shown;
+    renderPreview(shown);
+    updateFoot();
+  });
+
+  // Keep the token/char count live while the user edits the output.
+  sourceArea.addEventListener("input", updateFoot);
 
   // --- Tabs ---
   function switchTab(which) {
@@ -854,6 +1018,23 @@
     URL.revokeObjectURL(url);
   });
 
+  // Clear the result and return to the initial empty state.
+  const clearBtn = document.getElementById("clearBtn");
+  if (clearBtn) {
+    clearBtn.addEventListener("click", function () {
+      rawMarkdown = "";
+      sourceArea.value = "";
+      previewArea.innerHTML = "";
+      filenameEl.textContent = "";
+      resultFoot.textContent = "";
+      result.classList.remove("visible");
+      fileInput.value = "";
+      switchTab("source");
+      clearStatus();
+      dropzone.scrollIntoView({ behavior: "smooth", block: "nearest" });
+    });
+  }
+
   // --- Drag & drop / picker wiring ---
   dropzone.addEventListener("click", function () { fileInput.click(); });
   dropzone.addEventListener("keydown", function (e) {
@@ -861,8 +1042,8 @@
   });
 
   fileInput.addEventListener("change", function (e) {
-    if (e.target.files && e.target.files[0]) handleFile(e.target.files[0]);
-    fileInput.value = ""; // allow re-selecting the same file
+    if (e.target.files && e.target.files.length) handleFiles(e.target.files);
+    fileInput.value = ""; // allow re-selecting the same file(s)
   });
 
   ["dragenter", "dragover"].forEach(function (evt) {
@@ -879,12 +1060,29 @@
   });
   dropzone.addEventListener("drop", function (e) {
     const dt = e.dataTransfer;
-    if (dt && dt.files && dt.files[0]) handleFile(dt.files[0]);
+    if (dt && dt.files && dt.files.length) handleFiles(dt.files);
   });
 
   // Prevent the browser from opening a file dropped outside the zone
   window.addEventListener("dragover", function (e) { e.preventDefault(); });
   window.addEventListener("drop", function (e) { e.preventDefault(); });
+
+  // --- Paste from clipboard (rich HTML or plain text) ---
+  document.addEventListener("paste", function (e) {
+    if (document.activeElement === sourceArea) return; // let the user edit the output normally
+    const cd = e.clipboardData;
+    if (!cd) return;
+    const html = cd.getData("text/html");
+    const text = cd.getData("text/plain");
+    if (!html && !text) return;
+    e.preventDefault();
+    clearStatus();
+    let md;
+    try { md = html ? htmlToMd(extractMainHtml(html)) : text; }
+    catch (err) { md = text; }
+    filenameEl.textContent = "Appunti";
+    displayMarkdown(md, "appunti", false);
+  });
 
   // --- Startup check: warn (without blocking) if external libraries didn't load.
   //     Text formats (HTML, CSV, JSON, TXT, MD) still work as long as Turndown is present. ---
@@ -892,10 +1090,11 @@
     const missing = [];
     if (!window.mammoth) missing.push("Word .docx");
     if (!window.pdfjsLib) missing.push("PDF");
+    if (!window.XLSX) missing.push("Excel .xlsx");
     if (missing.length) {
       statusEl.className = "status loading show";
-      statusEl.textContent = "Nota: la conversione per " + missing.join(" e ") +
-        " non è disponibile (libreria esterna non caricata). HTML, CSV, JSON, TXT e MD funzionano comunque.";
+      statusEl.textContent = "Nota: la conversione per " + missing.join(", ") +
+        " non è disponibile (libreria esterna non caricata). HTML, CSV, JSON, TXT, MD e codice funzionano comunque.";
     }
   }
   // Give the CDN scripts a moment to settle before checking.
