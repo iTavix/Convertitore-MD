@@ -793,15 +793,41 @@
       .replace(/[ \t]+\n/g, "\n").replace(/\n{3,}/g, "\n\n").trim();
   }
 
-  // Extract the meaningful part of an HTML document: prefer <main>/<article>,
-  // otherwise the <body> — so <head>/<title>/scripts never leak into the output.
+  // Return the <body> inner HTML with head/scripts removed (no narrowing).
+  function htmlBodyInner(htmlString) {
+    try {
+      const doc = new DOMParser().parseFromString(htmlString, "text/html");
+      doc.querySelectorAll("script, style, noscript").forEach(function (n) { n.remove(); });
+      const root = doc.body || doc.documentElement;
+      return root ? root.innerHTML : htmlString;
+    } catch (e) { return htmlString; }
+  }
+
+  // Plain visible text of the document (last-resort fallback).
+  function htmlPlainText(htmlString) {
+    try {
+      const doc = new DOMParser().parseFromString(htmlString, "text/html");
+      doc.querySelectorAll("script, style, noscript").forEach(function (n) { n.remove(); });
+      const root = doc.body || doc.documentElement;
+      return root ? (root.textContent || "").replace(/[ \t]+\n/g, "\n").replace(/\n{3,}/g, "\n\n").trim() : "";
+    } catch (e) { return ""; }
+  }
+
+  // Prefer <main>/<article> ONLY if it holds the bulk of the page's text;
+  // otherwise use the whole body, so we never return an empty/partial container.
   function extractMainHtml(htmlString) {
     try {
       const doc = new DOMParser().parseFromString(htmlString, "text/html");
       doc.querySelectorAll("script, style, noscript").forEach(function (n) { n.remove(); });
-      const main = doc.querySelector("main, article");
-      const root = main || doc.body || doc.documentElement;
-      return root ? root.innerHTML : htmlString;
+      const body = doc.body || doc.documentElement;
+      if (!body) return htmlString;
+      const bodyLen = (body.textContent || "").trim().length;
+      const candidate = doc.querySelector("main") || doc.querySelector("article");
+      if (candidate) {
+        const cLen = (candidate.textContent || "").trim().length;
+        if (cLen >= bodyLen * 0.5 && cLen > 0) return candidate.innerHTML;
+      }
+      return body.innerHTML;
     } catch (e) {
       return htmlString;
     }
@@ -813,6 +839,14 @@
       try { return getTurndown().turndown(html); } catch (e) { /* fall through */ }
     }
     return htmlToMarkdownFallback(html);
+  }
+
+  // Robust HTML conversion with progressive fallbacks so content is never lost.
+  function htmlFileToMd(raw) {
+    let md = htmlToMd(extractMainHtml(raw));
+    if (!md || !md.trim()) md = htmlToMd(htmlBodyInner(raw)); // ignore main/article narrowing
+    if (!md || !md.trim()) md = htmlPlainText(raw);            // last resort: visible text
+    return md;
   }
 
   // Main dispatcher
@@ -845,8 +879,8 @@
     if (ext === "html" || ext === "htm") {
       showLoading("Conversione HTML…");
       const raw = await readAsText(file);
-      // Convert only the body / main content so head, title and scripts don't leak in.
-      return htmlToMd(extractMainHtml(raw));
+      // Convert only the body / main content, with fallbacks so content is never lost.
+      return htmlFileToMd(raw);
     }
 
     if (ext === "csv") {
@@ -1093,7 +1127,7 @@
     e.preventDefault();
     clearStatus();
     let md;
-    try { md = html ? htmlToMd(extractMainHtml(html)) : text; }
+    try { md = html ? htmlFileToMd(html) : text; }
     catch (err) { md = text; }
     filenameEl.textContent = "Appunti";
     displayMarkdown(md, "appunti", false);
