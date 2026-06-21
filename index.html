@@ -239,6 +239,24 @@
   /* Tabs */
   .tabs { display: flex; gap: 4px; background: var(--surface-2); padding: 3px; border-radius: 980px; }
 
+  /* HTML conversion mode control */
+  .html-mode { margin-top: 18px; }
+  .hm-row { display: flex; align-items: center; gap: 12px; flex-wrap: wrap; }
+  .hm-label {
+    font-size: 12px; font-weight: 600; letter-spacing: 0.02em;
+    color: var(--text-secondary); text-transform: uppercase;
+  }
+  .hm-options { display: inline-flex; gap: 4px; background: var(--surface-2); padding: 3px; border-radius: 980px; }
+  .hm-opt {
+    border: none; background: transparent; color: var(--text-secondary);
+    font-family: var(--font); font-size: 13px; font-weight: 500;
+    padding: 6px 14px; border-radius: 980px; cursor: pointer;
+    transition: background 0.2s ease, color 0.2s ease;
+  }
+  .hm-opt.active { background: var(--surface); color: var(--text); box-shadow: 0 1px 3px rgba(0,0,0,0.08); }
+  .hm-caption { margin-top: 8px; font-size: 12.5px; line-height: 1.4; color: var(--text-secondary); }
+  .hm-caption b { font-weight: 600; color: var(--text); }
+
   .tab {
     border: none;
     background: transparent;
@@ -443,6 +461,19 @@
   </div>
   <input type="file" id="fileInput" class="hidden" multiple>
 
+  <!-- HTML conversion mode -->
+  <div class="html-mode">
+    <div class="hm-row">
+      <span class="hm-label">HTML</span>
+      <div class="hm-options" role="group" aria-label="Modalità di conversione HTML">
+        <button class="hm-opt" data-mode="content">Contenuto</button>
+        <button class="hm-opt" data-mode="source">Sorgente</button>
+        <button class="hm-opt active" data-mode="both">Entrambi</button>
+      </div>
+    </div>
+    <p class="hm-caption">Solo per i file HTML: scegli se ottenere il <b>testo leggibile</b>, il <b>codice sorgente</b> in un blocco di codice, oppure <b>entrambi</b>.</p>
+  </div>
+
   <!-- Status -->
   <div class="status" id="status"></div>
 
@@ -451,7 +482,7 @@
     <div class="result-bar">
       <span class="filename" id="filename"></span>
       <label class="ai-toggle" title="Rimuove immagini base64, righe e spazi superflui">
-        <input type="checkbox" id="aiClean"> Ottimizza per AI
+        <input type="checkbox" id="aiClean" checked> Ottimizza per AI
       </label>
       <div class="tabs" role="tablist">
         <button class="tab active" id="tabSource" role="tab">Markdown</button>
@@ -497,6 +528,8 @@
 
   let currentBaseName = "documento";
   let rawMarkdown = ""; // last conversion before AI optimization
+  let htmlMode = "both"; // HTML conversion mode: content | source | both
+  let lastHtmlRaw = null; // raw HTML of the last single HTML conversion (for live mode switching)
 
   // --- Turndown (HTML -> Markdown), created lazily so a missing CDN
   //     never crashes the whole app at startup ---
@@ -849,12 +882,26 @@
     return md;
   }
 
+  // Build the HTML output according to the selected mode.
+  function htmlToMarkdownByMode(raw, mode) {
+    const fence = fenceFor(raw);
+    const sourceBlock = "## Codice sorgente\n\n" + fence + "html\n" + raw.replace(/\s+$/, "") + "\n" + fence;
+    if (mode === "source") return sourceBlock + "\n";
+    const content = htmlFileToMd(raw);
+    if (mode === "content") return (content && content.trim() ? content.trim() : "_Nessun contenuto testuale in questo HTML._") + "\n";
+    const parts = [];
+    if (content && content.trim()) parts.push("## Contenuto\n\n" + content.trim());
+    parts.push(sourceBlock);
+    return parts.join("\n\n---\n\n") + "\n";
+  }
+
   // Main dispatcher
   async function convertFile(file) {
     const name = file.name || "documento";
     const dot = name.lastIndexOf(".");
     const ext = dot >= 0 ? name.slice(dot + 1).toLowerCase() : "";
     currentBaseName = dot >= 0 ? name.slice(0, dot) : name;
+    lastHtmlRaw = null;
 
     if (ext === "pdf") {
       showLoading("Estrazione del testo dal PDF…");
@@ -879,8 +926,8 @@
     if (ext === "html" || ext === "htm") {
       showLoading("Conversione HTML…");
       const raw = await readAsText(file);
-      // Convert only the body / main content, with fallbacks so content is never lost.
-      return htmlFileToMd(raw);
+      lastHtmlRaw = raw;
+      return htmlToMarkdownByMode(raw, htmlMode);
     }
 
     if (ext === "csv") {
@@ -1000,6 +1047,7 @@
         }
       }
       clearStatus();
+      lastHtmlRaw = null; // mode switch applies per-batch, not to a single file here
       filenameEl.textContent = files.length + " file";
       displayMarkdown(parts.join("\n\n---\n\n") + "\n", "documenti");
       if (failed.length) showError(failed.length + " file non convertiti: " + failed.join(", "));
@@ -1127,10 +1175,29 @@
     e.preventDefault();
     clearStatus();
     let md;
-    try { md = html ? htmlFileToMd(html) : text; }
-    catch (err) { md = text; }
+    if (html) { lastHtmlRaw = html; try { md = htmlToMarkdownByMode(html, htmlMode); } catch (err) { md = text; } }
+    else { lastHtmlRaw = null; md = text; }
     filenameEl.textContent = "Appunti";
     displayMarkdown(md, "appunti", false);
+  });
+
+  // --- HTML mode switch (Contenuto / Sorgente / Entrambi) ---
+  Array.prototype.forEach.call(document.querySelectorAll(".hm-opt"), function (btn) {
+    btn.addEventListener("click", function () {
+      htmlMode = btn.getAttribute("data-mode");
+      Array.prototype.forEach.call(document.querySelectorAll(".hm-opt"), function (b) {
+        b.classList.toggle("active", b === btn);
+      });
+      // Re-render the current HTML result instantly, without re-reading the file.
+      if (lastHtmlRaw != null && result.classList.contains("visible")) {
+        const md = htmlToMarkdownByMode(lastHtmlRaw, htmlMode);
+        rawMarkdown = md;
+        const shown = aiClean.checked ? cleanForAI(md) : md;
+        sourceArea.value = shown;
+        renderPreview(shown);
+        updateFoot();
+      }
+    });
   });
 
   // --- Startup check: warn (without blocking) if external libraries didn't load.
