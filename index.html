@@ -20,13 +20,13 @@
 <meta name="apple-mobile-web-app-status-bar-style" content="default">
 <meta name="mobile-web-app-capable" content="yes">
 
-<!-- Conversion libraries (run client-side in the browser) -->
-<script src="https://cdnjs.cloudflare.com/ajax/libs/turndown/7.2.0/turndown.min.js"></script>
-<script src="https://cdnjs.cloudflare.com/ajax/libs/turndown-plugin-gfm/1.0.2/turndown-plugin-gfm.min.js"></script>
-<script src="https://cdnjs.cloudflare.com/ajax/libs/mammoth/1.8.0/mammoth.browser.min.js"></script>
-<script src="https://cdnjs.cloudflare.com/ajax/libs/marked/12.0.2/marked.min.js"></script>
-<script src="https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.min.js"></script>
-<script src="https://cdnjs.cloudflare.com/ajax/libs/xlsx/0.18.5/xlsx.full.min.js"></script>
+<!-- Conversion libraries: local copies in lib/, so the app also works offline -->
+<script src="lib/turndown.min.js"></script>
+<script src="lib/turndown-plugin-gfm.min.js"></script>
+<script src="lib/mammoth.browser.min.js"></script>
+<script src="lib/marked.min.js"></script>
+<script src="lib/pdf.min.js"></script>
+<script src="lib/xlsx.full.min.js"></script>
 
 <style>
   :root {
@@ -529,6 +529,7 @@
   let currentBaseName = "documento";
   let rawMarkdown = ""; // last conversion before AI optimization
   let htmlMode = "both"; // HTML conversion mode: content | source | both
+  let htmlModeChosen = false; // true once the user clicks a mode button
   let lastHtmlRaw = null; // raw HTML of the last single HTML conversion (for live mode switching)
 
   // --- Turndown (HTML -> Markdown), created lazily so a missing CDN
@@ -556,7 +557,7 @@
   // --- pdf.js worker setup ---
   if (window.pdfjsLib) {
     window.pdfjsLib.GlobalWorkerOptions.workerSrc =
-      "https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.worker.min.js";
+      "lib/pdf.worker.min.js";
   }
 
   // --- Status helpers ---
@@ -580,13 +581,22 @@
   }
 
   // --- Read helpers ---
-  function readAsText(file) {
-    return new Promise(function (resolve, reject) {
-      const r = new FileReader();
-      r.onload = function () { resolve(r.result); };
-      r.onerror = function () { reject(new Error("Lettura del file non riuscita.")); };
-      r.readAsText(file);
-    });
+  // Decode as UTF-8; if the bytes aren't valid UTF-8 (e.g. an old Windows/Latin-1
+  // file), fall back to windows-1252 so accented letters survive.
+  async function readAsText(file) {
+    return (await readTextInfo(file)).text;
+  }
+
+  async function readTextInfo(file) {
+    const bytes = new Uint8Array(await readAsArrayBuffer(file));
+    const binary = looksBinary(bytes);
+    let text;
+    try {
+      text = new TextDecoder("utf-8", { fatal: true }).decode(bytes);
+    } catch (e) {
+      text = new TextDecoder("windows-1252").decode(bytes);
+    }
+    return { text: text, binary: binary };
   }
 
   function readAsArrayBuffer(file) {
@@ -615,21 +625,43 @@
     return md;
   }
 
+  // Excel date cell -> unambiguous ISO date (with time only when it isn't midnight).
+  function formatSheetDate(d) {
+    // SheetJS dates can be a few seconds off: round to the nearest minute first.
+    const t = new Date(Math.round(d.getTime() / 60000) * 60000);
+    const p = function (n) { return String(n).padStart(2, "0"); };
+    const date = t.getFullYear() + "-" + p(t.getMonth() + 1) + "-" + p(t.getDate());
+    return (t.getHours() || t.getMinutes()) ? date + " " + p(t.getHours()) + ":" + p(t.getMinutes()) : date;
+  }
+
   // XLSX/XLS -> one Markdown table per sheet (via SheetJS)
   async function xlsxToMarkdown(buffer) {
     if (!window.XLSX) throw new Error("Libreria per i fogli di calcolo non caricata: controlla la connessione e riprova.");
-    const wb = window.XLSX.read(buffer, { type: "array" });
+    const wb = window.XLSX.read(buffer, { type: "array", cellDates: true });
     const parts = [];
     wb.SheetNames.forEach(function (name) {
-      const rows = window.XLSX.utils.sheet_to_json(wb.Sheets[name], { header: 1, blankrows: false, defval: "" });
+      const rows = window.XLSX.utils.sheet_to_json(wb.Sheets[name], { header: 1, blankrows: false, defval: "" })
+        .map(function (r) { return r.map(function (c) { return c instanceof Date ? formatSheetDate(c) : c; }); });
       if (rows.length) parts.push("### " + name + "\n\n" + rowsToMdTable(rows));
     });
     return parts.join("\n\n") || "_Foglio di calcolo vuoto._";
   }
 
+  // Guess the separator from the first lines: Italian Excel exports use ";",
+  // TSV uses tabs. Quoted text is ignored so "a, b" doesn't count as a comma.
+  function detectDelimiter(text) {
+    const sample = text.slice(0, 5000).replace(/"(?:[^"]|"")*"/g, "").split(/\r\n|\n|\r/).slice(0, 10);
+    let best = ",", bestScore = 0;
+    [",", ";", "\t", "|"].forEach(function (d) {
+      const score = sample.reduce(function (s, line) { return s + (line.split(d).length - 1); }, 0);
+      if (score > bestScore) { best = d; bestScore = score; }
+    });
+    return best;
+  }
+
   // CSV string -> Markdown table (handles quoted fields and embedded commas/quotes)
-  function csvToMarkdown(text) {
-    const rows = parseCsv(text);
+  function csvToMarkdown(text, delimiter) {
+    const rows = parseCsv(text, delimiter || detectDelimiter(text));
     if (!rows.length) return "";
     const cols = Math.max.apply(null, rows.map(function (r) { return r.length; }));
     const pad = function (r) {
@@ -647,7 +679,8 @@
   }
 
   // Minimal RFC-4180-ish CSV parser
-  function parseCsv(text) {
+  function parseCsv(text, delimiter) {
+    const sep = delimiter || ",";
     const rows = [];
     let row = [];
     let field = "";
@@ -662,7 +695,7 @@
         } else { field += ch; }
       } else {
         if (ch === '"') { inQuotes = true; }
-        else if (ch === ",") { row.push(field); field = ""; }
+        else if (ch === sep) { row.push(field); field = ""; }
         else if (ch === "\n") { row.push(field); rows.push(row); row = []; field = ""; }
         else { field += ch; }
       }
@@ -688,10 +721,14 @@
       });
       // Collapse excessive blank lines
       text = text.replace(/[ \t]+\n/g, "\n").replace(/\n{3,}/g, "\n\n").trim();
-      pages.push(text);
+      if (text) pages.push(text); // skip image-only pages instead of emitting empty "---"
     }
     const body = pages.join("\n\n---\n\n");
-    return body || "_Nessun testo estraibile: il PDF potrebbe essere composto da immagini scansionate._";
+    if (!body) return "_Nessun testo estraibile: il PDF potrebbe essere composto da immagini scansionate._";
+    const skipped = pdf.numPages - pages.length;
+    return skipped
+      ? body + "\n\n_(" + skipped + " pagin" + (skipped === 1 ? "a" : "e") + " su " + pdf.numPages + " senza testo estraibile, probabilmente immagini.)_"
+      : body;
   }
 
   // Map file extensions to Markdown code-fence language hints.
@@ -721,26 +758,32 @@
     return "`".repeat(Math.max(3, max + 1));
   }
 
-  // Heuristic: does the decoded text look like binary garbage rather than text?
-  function looksBinary(text) {
-    if (!text) return false;
-    const n = Math.min(text.length, 2000);
-    let bad = 0;
+  // Heuristic on the raw bytes: a NUL byte, or many control characters,
+  // means binary data (images, archives…) rather than text.
+  function looksBinary(bytes) {
+    const n = Math.min(bytes.length, 8000);
+    if (!n) return false;
+    let ctrl = 0;
     for (let i = 0; i < n; i++) {
-      const c = text.charCodeAt(i);
-      if (c === 0 || c === 0xFFFD) bad++;
+      const b = bytes[i];
+      if (b === 0) return true;
+      if (b < 32 && b !== 9 && b !== 10 && b !== 13 && b !== 12 && b !== 27) ctrl++;
     }
-    return bad / n > 0.1;
+    return ctrl / n > 0.05;
   }
 
   // JSON -> fenced code block (pretty-printed)
   function jsonToMarkdown(text) {
-    try {
-      const obj = JSON.parse(text);
-      return "```json\n" + JSON.stringify(obj, null, 2) + "\n```\n";
-    } catch (e) {
-      return "```\n" + text + "\n```\n";
+    const body = text.replace(/\s+$/, "");
+    let pretty = body;
+    // Integers with 16+ digits would be rounded by JSON.parse: keep the original text then.
+    if (!/(^|[^\d.eE])-?\d{16,}/.test(body)) {
+      try { pretty = JSON.stringify(JSON.parse(body), null, 2); } catch (e) { /* invalid JSON: keep as-is */ }
     }
+    let valid = true;
+    try { JSON.parse(body); } catch (e) { valid = false; }
+    const fence = fenceFor(pretty);
+    return fence + (valid ? "json" : "") + "\n" + pretty + "\n" + fence + "\n";
   }
 
   // Dependency-free HTML -> Markdown, using the browser's built-in DOMParser.
@@ -877,12 +920,12 @@
   // Robust HTML conversion with progressive fallbacks so content is never lost.
   function htmlFileToMd(raw) {
     let md = htmlToMd(extractMainHtml(raw));
-    if (!md || !md.trim()) md = htmlToMd(htmlBodyInner(raw)); // ignore main/article narrowing
-    if (!md || !md.trim()) md = htmlPlainText(raw);            // last resort: visible text
+    if (!md || !md.trim()) md = htmlToMd(htmlBodyInner(raw));
+    if (!md || !md.trim()) md = htmlPlainText(raw);
     return md;
   }
 
-  // Build the HTML output according to the selected mode.
+  // Build the HTML output according to the selected mode (content / source / both).
   function htmlToMarkdownByMode(raw, mode) {
     const fence = fenceFor(raw);
     const sourceBlock = "## Codice sorgente\n\n" + fence + "html\n" + raw.replace(/\s+$/, "") + "\n" + fence;
@@ -926,14 +969,14 @@
     if (ext === "html" || ext === "htm") {
       showLoading("Conversione HTML…");
       const raw = await readAsText(file);
-      lastHtmlRaw = raw;
+      lastHtmlRaw = raw; // enable live content/source/both switching
       return htmlToMarkdownByMode(raw, htmlMode);
     }
 
-    if (ext === "csv") {
+    if (ext === "csv" || ext === "tsv") {
       showLoading("Generazione tabella Markdown…");
       const text = await readAsText(file);
-      return csvToMarkdown(text);
+      return csvToMarkdown(text, ext === "tsv" ? "\t" : null);
     }
 
     if (ext === "json") {
@@ -950,8 +993,9 @@
     // Any other text-based or source-code file: wrap it in a fenced code block
     // with a language hint — the cleanest way to feed code to an AI.
     showLoading("Lettura del file…");
-    const text = await readAsText(file);
-    if (looksBinary(text)) {
+    const info = await readTextInfo(file);
+    const text = info.text;
+    if (info.binary) {
       throw new Error("Il file “." + ext + "” sembra binario e non può essere letto come testo. Usa PDF, DOCX o un file di testo/codice.");
     }
     const baseName = (file.name || "").toLowerCase();
@@ -1003,7 +1047,11 @@
     return md
       .replace(/!\[([^\]]*)\]\(\s*data:[^)]*\)/gi, "![$1]")   // drop base64/data-URI images
       .replace(/\]\(\s*data:[^)]*\)/gi, "]()")                 // drop data-URI links
-      .replace(/[ \t]+$/gm, "")                                // trim trailing whitespace
+      .replace(/data:[\w.+\/-]+;base64,[A-Za-z0-9+\/=\s]{100,}/g, "data:…")  // base64 left in HTML source / CSS
+      .replace(/^[ \t]+$/gm, "")                               // whitespace-only lines
+      .replace(/[ \t]+$/gm, function (ws) {                    // trim trailing whitespace, but keep
+        return /^ {2,}$/.test(ws) ? "  " : "";                 // "two spaces" Markdown line breaks
+      })
       .replace(/\n{3,}/g, "\n\n")                              // collapse blank lines
       .trim();
   }
@@ -1059,9 +1107,30 @@
   // Backwards-compatible single-file entry point.
   function handleFile(file) { return handleFiles([file]); }
 
+  // The preview renders untrusted file content: strip anything that could run
+  // code (scripts, event handlers, javascript: links) before showing it.
+  function sanitizeHtml(html) {
+    const tpl = document.createElement("template"); // inert: nothing loads or runs here
+    tpl.innerHTML = html;
+    tpl.content.querySelectorAll("script, style, iframe, frame, object, embed, link, meta, base, form, svg, math")
+      .forEach(function (n) { n.remove(); });
+    tpl.content.querySelectorAll("*").forEach(function (el) {
+      Array.prototype.slice.call(el.attributes).forEach(function (a) {
+        const name = a.name.toLowerCase();
+        const val = a.value.replace(/[\s\u0000-\u001f]/g, "").toLowerCase();
+        if (name.indexOf("on") === 0 || name === "style" || name === "srcdoc" ||
+            (/^(href|src|xlink:href|action|formaction|poster|background)$/.test(name) &&
+             /^(javascript|vbscript|data:text)/.test(val))) {
+          el.removeAttribute(a.name);
+        }
+      });
+    });
+    return tpl.innerHTML;
+  }
+
   function renderPreview(md) {
     if (window.marked) {
-      previewArea.innerHTML = window.marked.parse(md);
+      previewArea.innerHTML = sanitizeHtml(window.marked.parse(md));
     }
   }
 
@@ -1175,20 +1244,30 @@
     e.preventDefault();
     clearStatus();
     let md;
-    if (html) { lastHtmlRaw = html; try { md = htmlToMarkdownByMode(html, htmlMode); } catch (err) { md = text; } }
+    // Pasted rich text: show the readable content only, unless the user has
+    // explicitly picked a mode — the clipboard's HTML source is mostly noise.
+    if (html) {
+      lastHtmlRaw = html;
+      if (!htmlModeChosen) setHtmlMode("content");
+      try { md = htmlToMarkdownByMode(html, htmlMode); } catch (err) { md = text; }
+    }
     else { lastHtmlRaw = null; md = text; }
     filenameEl.textContent = "Appunti";
     displayMarkdown(md, "appunti", false);
   });
 
   // --- HTML mode switch (Contenuto / Sorgente / Entrambi) ---
+  function setHtmlMode(mode) {
+    htmlMode = mode;
+    Array.prototype.forEach.call(document.querySelectorAll(".hm-opt"), function (b) {
+      b.classList.toggle("active", b.getAttribute("data-mode") === mode);
+    });
+  }
+
   Array.prototype.forEach.call(document.querySelectorAll(".hm-opt"), function (btn) {
     btn.addEventListener("click", function () {
-      htmlMode = btn.getAttribute("data-mode");
-      Array.prototype.forEach.call(document.querySelectorAll(".hm-opt"), function (b) {
-        b.classList.toggle("active", b === btn);
-      });
-      // Re-render the current HTML result instantly, without re-reading the file.
+      htmlModeChosen = true;
+      setHtmlMode(btn.getAttribute("data-mode"));
       if (lastHtmlRaw != null && result.classList.contains("visible")) {
         const md = htmlToMarkdownByMode(lastHtmlRaw, htmlMode);
         rawMarkdown = md;
@@ -1199,6 +1278,25 @@
       }
     });
   });
+
+  // --- Popup vs full-tab mode ---
+  // The extension opens as a compact toolbar popup. The "Apri in una scheda"
+  // button reopens the same page full-size in a tab (?tab=1 widens the layout).
+  (function () {
+    const extApi = globalThis.browser || globalThis.chrome;
+    if (/[?&]tab=1\b/.test(location.search)) document.body.classList.add("full");
+    const openTabBtn = document.getElementById("openTab");
+    if (openTabBtn) {
+      openTabBtn.addEventListener("click", function () {
+        const url = (extApi && extApi.runtime && extApi.runtime.getURL)
+          ? extApi.runtime.getURL("converter.html?tab=1")
+          : (location.pathname + "?tab=1");
+        if (extApi && extApi.tabs && extApi.tabs.create) extApi.tabs.create({ url: url });
+        else window.open(url, "_blank");
+        if (window.close) window.close();
+      });
+    }
+  })();
 
   // --- Startup check: warn (without blocking) if external libraries didn't load.
   //     Text formats (HTML, CSV, JSON, TXT, MD) still work as long as Turndown is present. ---
